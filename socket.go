@@ -110,6 +110,7 @@ func (v *VirtioSocketDevice) Listen(port uint32) (*VirtioSocketListener, error) 
 		port:        port,
 		handle:      handle,
 		acceptch:    ch,
+		done:        make(chan struct{}),
 	}
 
 	C.VZVirtioSocketDevice_setSocketListenerForPort(
@@ -174,25 +175,41 @@ type VirtioSocketListener struct {
 	handle      cgo.Handle
 	port        uint32
 	acceptch    chan connResults
+	done        chan struct{}
 	closeOnce   sync.Once
 }
 
 var _ net.Listener = (*VirtioSocketListener)(nil)
 
 // Accept implements the Accept method in the Listener interface; it waits for the next call and returns a net.Conn.
+// Close unblocks a parked Accept, which then returns net.ErrClosed (standard net.Listener semantics).
 func (v *VirtioSocketListener) Accept() (net.Conn, error) {
-	return v.AcceptVirtioSocketConnection()
+	select {
+	case result := <-v.acceptch:
+		if result.err != nil {
+			return nil, result.err
+		}
+		return result.conn, nil
+	case <-v.done:
+		return nil, net.ErrClosed
+	}
 }
 
 // AcceptVirtioSocketConnection accepts the next incoming call and returns the new connection.
 func (v *VirtioSocketListener) AcceptVirtioSocketConnection() (*VirtioSocketConnection, error) {
-	result := <-v.acceptch
-	return result.conn, result.err
+	select {
+	case result := <-v.acceptch:
+		return result.conn, result.err
+	case <-v.done:
+		return nil, net.ErrClosed
+	}
 }
 
-// Close stops listening on the virtio socket.
+// Close stops listening on the virtio socket. Closing done unblocks any parked Accept;
+// acceptch is never closed, so the connection handler's send can't panic.
 func (v *VirtioSocketListener) Close() error {
 	v.closeOnce.Do(func() {
+		close(v.done)
 		C.VZVirtioSocketDevice_removeSocketListenerForPort(
 			objc.Ptr(v.vsockDevice),
 			v.vsockDevice.dispatchQueue,
